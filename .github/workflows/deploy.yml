@@ -1,0 +1,303 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      app-version:
+        description: 'Version to deploy ("current" deploys app from previous env )'
+        default: 'current'
+        required: true
+      environment:
+        description: 'Environment to deploy to'
+        type: environment
+        required: true
+
+env:
+  ENVIRONMENT_NAME            : ${{ github.event.inputs.environment }}
+  APP_VERSION                 : ${{ github.event.inputs.app-version }}
+  PROJECT                     : nft
+  APP_NAME                    : merge-drop
+  TAG_COMMIT_ON_DEPLOYMENT    : true
+
+jobs:
+
+  get-app-version:
+    runs-on: [ self-hosted, dind ]
+    environment: stg
+    outputs:
+      version: ${{ steps.current_version.outputs.version }}
+
+    steps:
+
+    - name: Set up kubelogin for non-interactive login
+      if: ${{ github.event.inputs.app-version == 'current' }}
+      run: |
+        curl -LO https://github.com/Azure/kubelogin/releases/download/v0.0.13/kubelogin-linux-amd64.zip
+        sudo unzip -j kubelogin-linux-amd64.zip -d /usr/local/bin
+
+    - name: Set up kubelogin for non-interactive login and get current image
+      if: ${{ github.event.inputs.app-version == 'current' }}
+      id: current_version
+      run: |
+        az login --service-principal -u ${{ secrets.AZURE_AKS_USER }} -p ${{ secrets.AZURE_AKS_PASSWORD }} --tenant ${{ secrets.AZURE_AKS_TENANT }}
+        az account set -s ${{ secrets.AZURE_AKS_SUBSCRIPTION }}
+        az aks get-credentials -g nft-staging -n nft-staging
+        kubelogin convert-kubeconfig -l spn
+        export AAD_SERVICE_PRINCIPAL_CLIENT_ID=${{ secrets.AZURE_AKS_USER }}
+        export AAD_SERVICE_PRINCIPAL_CLIENT_SECRET=${{ secrets.AZURE_AKS_PASSWORD }}
+        CURRENT_VERSION=$(kubectl get pods -n ${{ env.PROJECT }}-${{ env.APP_NAME }} \
+        -o jsonpath="{.items[*].spec.containers[*].image}" \
+        | tr -s '[[:space:]]' '\n' |sort | uniq | grep ${{ env.APP_NAME }} | sed 's/.*://g')
+        echo "::set-output name=version::${CURRENT_VERSION}"
+
+    - name: Login to Azure Registry
+      uses: docker/login-action@d398f07826957cd0a18ea1b059cf1207835e60bc #v1
+      with:
+        registry: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+        username: ${{ secrets.AZURE_CLIENT_ID }}
+        password: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+    - name: Pull down app version and save
+      if: ${{ github.event.inputs.app-version != 'current' }}
+      id: pull_image_deps
+      run: |
+        docker pull ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}-deps:${{ env.APP_VERSION }}-deps
+        docker save ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}-deps:${{ env.APP_VERSION }}-deps > /tmp/${{ env.PROJECT }}-${{ env.APP_NAME }}-deps.tar
+
+    - name: Pull down app version and save
+      if: ${{ github.event.inputs.app-version != 'current' }}
+      id: pull_image
+      run: |
+        docker pull ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}:${{ env.APP_VERSION }}
+        docker save ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}:${{ env.APP_VERSION }} > /tmp/${{ env.PROJECT }}-${{ env.APP_NAME }}.tar
+
+
+    - name: Pull down app version and save
+      if: ${{ github.event.inputs.app-version == 'current' }}
+      id: pull_image_deps_current
+      run: |
+        docker pull ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}-deps:${{ steps.current_version.outputs.version }}-deps
+        docker save ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}-deps:${{ steps.current_version.outputs.version }}-deps > /tmp/${{ env.PROJECT }}-${{ env.APP_NAME }}-deps.tar
+
+    - name: Pull down app version and save
+      if: ${{ github.event.inputs.app-version == 'current' }}
+      id: pull_image_current
+      run: |
+        docker pull ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}:${{ steps.current_version.outputs.version }}
+        docker save ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}:${{ steps.current_version.outputs.version }} > /tmp/${{ env.PROJECT }}-${{ env.APP_NAME }}.tar
+
+    - name: Run Trivy vulnerability scanner
+      if: ${{ github.event.inputs.app-version != 'current' }}
+      uses: aquasecurity/trivy-action@cb606dfdb0d2b3698ace62192088ef4f5360b24f # 0.2.5
+      with:
+        image-ref: ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}:${{ env.APP_VERSION }}
+        format: 'table'
+        exit-code: '1'
+        ignore-unfixed: true
+        severity: 'CRITICAL,HIGH'
+
+    - name: Run Trivy vulnerability scanner
+      if: ${{ github.event.inputs.app-version == 'current' }}
+      uses: aquasecurity/trivy-action@cb606dfdb0d2b3698ace62192088ef4f5360b24f # 0.2.5
+      with:
+        image-ref: ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}:${{ steps.current_version.outputs.version }}
+        format: 'table'
+        exit-code: '1'
+        vuln-type: 'os'
+        ignore-unfixed: true
+        severity: 'CRITICAL,HIGH'
+
+    - name: Upload frontend image as artifact
+      uses: actions/upload-artifact@3cea5372237819ed00197afe530f5a7ea3e805c8 # v3
+      with:
+        name: ${{ env.APP_VERSION }}
+        path: /tmp/${{ env.PROJECT }}-${{ env.APP_NAME }}*.tar
+
+  deploy:
+    runs-on: [ self-hosted, dind ]
+    environment: ${{ github.event.inputs.environment }}
+    needs: get-app-version
+
+    steps:
+    - name: Download Image from previous workflow
+      uses: actions/download-artifact@076f0f7dd036d87e8e04f5f00d614e790308961b # v3
+      with:
+        name: ${{ env.APP_VERSION }}
+        path: /tmp
+
+    - name: Login to Azure Registry
+      uses: docker/login-action@d398f07826957cd0a18ea1b059cf1207835e60bc #v1
+      with:
+        registry: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+        username: ${{ secrets.AZURE_CLIENT_ID }}
+        password: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+    - name: Install kubelogin to get current deployed version
+      if: ${{ github.event.inputs.app-version == 'current' }}
+      run: |
+        curl -LO https://github.com/Azure/kubelogin/releases/download/v0.0.13/kubelogin-linux-amd64.zip
+        sudo unzip -j kubelogin-linux-amd64.zip -d /usr/local/bin
+
+    - name: Set up kubelogin for non-interactive login and current deployed version
+      if: ${{ github.event.inputs.app-version == 'current' }}
+      id: previous_version
+      run: |
+        if [[ "${{ github.event.inputs.environment }}" == "prd" ]]; then export LONG_NAME_ENV=prod; else export LONG_NAME_ENV=dev; fi
+        az login --service-principal -u ${{ secrets.AZURE_AKS_USER }} -p ${{ secrets.AZURE_AKS_PASSWORD }} --tenant ${{ secrets.AZURE_AKS_TENANT }}
+        az account set -s ${{ secrets.AZURE_AKS_SUBSCRIPTION }}
+        az aks get-credentials -g ${{ env.PROJECT }}-${LONG_NAME_ENV} -n ${{ env.PROJECT }}-${LONG_NAME_ENV}
+        kubelogin convert-kubeconfig -l spn
+        export AAD_SERVICE_PRINCIPAL_CLIENT_ID=${{ secrets.AZURE_AKS_USER }}
+        export AAD_SERVICE_PRINCIPAL_CLIENT_SECRET=${{ secrets.AZURE_AKS_PASSWORD }}
+        PREVIOUS_VERSION=$(kubectl get pods -n ${{ env.PROJECT }}-${{ env.APP_NAME }} \
+        -o jsonpath="{.items[*].spec.containers[*].image}" \
+        | tr -s '[[:space:]]' '\n' | sort | uniq | grep ${{ env.APP_NAME }} | sed 's/.*://g' | sed 's/.*\.//g' | sed 's/-.*//g')
+        echo "::set-output name=version::${PREVIOUS_VERSION}"
+
+    - name: Check out repository code
+      uses: actions/checkout@2541b1294d2704b0964813337f33b291d3f8596b # v2
+      with:
+        fetch-depth: 0
+
+    - name: Get commit delta from previous to current
+      id: git_log
+      run: |
+        START_GIT=$(echo ${{ needs.get-app-version.outputs.version }} | sed 's/.*\.//g' | sed 's/-.*//g')
+        echo "## Release Notes" >> body.md
+        git --no-pager log --pretty=format:"%h %an%x09%s" ${START_GIT} ^${{ steps.previous_version.outputs.version }}^ >> body.md
+
+    - name: Make some vars for tagging
+      run: |
+        NOW=$(date "+%s")
+        echo "env_update=$(echo $APP_VERSION | sed "s/dev/$ENVIRONMENT_NAME/g" | sed "s/.*\./${NOW}\./g")" >> $GITHUB_ENV
+
+    - name: Make some vars for tagging
+      if: ${{ github.event.inputs.app-version == 'current' }}
+      run: |
+        NOW=$(date "+%s")
+        echo "env_update=$(echo ${{ needs.get-app-version.outputs.version }} | sed "s/dev/$ENVIRONMENT_NAME/g" | sed "s/.*\./${NOW}\./g")" >> $GITHUB_ENV
+
+    - name: Load app, tag, push
+      if: ${{ github.event.inputs.app-version == 'current' }}
+      run: |
+        docker load --input /tmp/${{ env.PROJECT }}-${{ env.APP_NAME }}.tar
+        docker tag nftdev.azurecr.io/${{ env.PROJECT }}/${{ env.APP_NAME }}:${{ needs.get-app-version.outputs.version }} ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}:${{ env.env_update }}
+        docker push ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}:${{ env.env_update }}
+
+    - name: Load deps, tag, push
+      if: ${{ github.event.inputs.app-version == 'current' }}
+      run: |
+        docker load --input /tmp/${{ env.PROJECT }}-${{ env.APP_NAME }}-deps.tar
+        docker tag nftdev.azurecr.io/${{ env.PROJECT }}/${{ env.APP_NAME }}-deps:${{ needs.get-app-version.outputs.version }}-deps ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}-deps:${{ env.env_update }}-deps
+        docker push ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}-deps:${{ env.env_update }}-deps
+
+    - name: Load app, tag, push
+      if: ${{ github.event.inputs.app-version != 'current' }}
+      run: |
+        docker load --input /tmp/${{ env.PROJECT }}-${{ env.APP_NAME }}.tar
+        docker tag nftdev.azurecr.io/${{ env.PROJECT }}/${{ env.APP_NAME }}:${{ env.APP_VERSION }} ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}:${{ env.env_update }}
+        docker push ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}:${{ env.env_update }}
+
+    - name: Load deps, tag, push
+      if: ${{ github.event.inputs.app-version != 'current' }}
+      run: |
+        docker load --input /tmp/${{ env.PROJECT }}-${{ env.APP_NAME }}-deps.tar
+        docker tag nftdev.azurecr.io/${{ env.PROJECT }}/${{ env.APP_NAME }}-deps:${{ env.APP_VERSION }}-deps ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}-deps:${{ env.env_update }}-deps
+        docker push ${{ secrets.AZURE_CONTAINER_REGISTRY }}/${{ env.PROJECT }}/${{ env.APP_NAME }}-deps:${{ env.env_update }}-deps
+
+    - uses: ncipollo/release-action@58ae73b360456532aafd58ee170c045abbeaee37 #v1.10.0
+      if: ${{ github.event.inputs.app-version == 'current' }}
+      id: release
+      with:
+        name: ${{ env.APP_NAME }}
+        tag: ${{ env.current_date }}.${{ env.sha_short }}-${{ github.event.inputs.environment }}
+        bodyFile: "body.md"
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Send Slack Notification
+      if: success() && ${{ github.event.inputs.app-version != 'current' }}
+      uses: slackapi/slack-github-action@3ca3c28b42eb71608c75e2118612048b170e7ffd # v1.19.0
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+      with:
+        status: custom
+        # Preview using https://api.slack.com/docs/messages/builder
+        payload: |
+          {
+            "attachments": [
+              {
+                "color": "good",
+                "fallback": "Successful deployment to `${{ env.ENVIRONMENT_NAME }}`",
+                "title": "Successful deployment to `${{ env.ENVIRONMENT_NAME }}`",
+                "text": "`${{ github.event.inputs.app-version }}` of `${{ env.APP_NAME }}` deployed",
+                "footer": "<${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}|GitHub Actions Run #${{ github.run_id }}>",
+                "footer_icon": "https://github.com/favicon.ico"
+              }
+            ]
+          }
+
+    - name: Send Slack Notification
+      if: success() && ${{ github.event.inputs.app-version == 'current' }}
+      uses: slackapi/slack-github-action@3ca3c28b42eb71608c75e2118612048b170e7ffd # v1.19.0
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+      with:
+        status: custom
+        # Preview using https://api.slack.com/docs/messages/builder
+        payload: |
+          {
+            "attachments": [
+              {
+                "color": "good",
+                "fallback": "Successful deployment to `${{ env.ENVIRONMENT_NAME }}`",
+                "title": "Successful deployment to `${{ env.ENVIRONMENT_NAME }}`",
+                "text": "`${{ needs.get-app-version.outputs.version }}` of `${{ env.APP_NAME }}` deployed",
+                "footer": "<${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}|GitHub Actions Run #${{ github.run_id }}>",
+                "footer_icon": "https://github.com/favicon.ico"
+              }
+            ]
+          }
+
+    - name: Send Failure Slack Notification
+      if: failure() && ${{ github.event.inputs.app-version != 'current' }}
+      uses: slackapi/slack-github-action@3ca3c28b42eb71608c75e2118612048b170e7ffd # v1.19.0
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+      with:
+        status: custom
+        # Preview using https://api.slack.com/docs/messages/builder
+        payload: |
+          {
+            "attachments": [
+              {
+                "color": "#cb2431",
+                "text": "Failure deploying `${{ github.event.inputs.app-version }}` in *${{ env.APP_NAME }}'s ${{ github.workflow }}* workflow.",
+                "footer": "<${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}|GitHub Actions Run #${{ github.run_id }}>",
+                "footer_icon": "https://github.com/favicon.ico"
+              }
+            ]
+          }
+
+    - name: Send Failure Slack Notification
+      if: failure() && ${{ github.event.inputs.app-version == 'current' }}
+      uses: slackapi/slack-github-action@3ca3c28b42eb71608c75e2118612048b170e7ffd # v1.19.0
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+      with:
+        status: custom
+        # Preview using https://api.slack.com/docs/messages/builder
+        payload: |
+          {
+            "attachments": [
+              {
+                "color": "#cb2431",
+                "text": "Failure deploying `${{ needs.get-app-version.outputs.version }}` in *${{ env.APP_NAME }}'s ${{ github.workflow }}* workflow.",
+                "footer": "<${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}|GitHub Actions Run #${{ github.run_id }}>",
+                "footer_icon": "https://github.com/favicon.ico"
+              }
+            ]
+          }
